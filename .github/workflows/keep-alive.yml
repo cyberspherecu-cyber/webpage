@@ -1,0 +1,39 @@
+# ─── Render Backend Keep-Alive ─────────────────────────────────────────────
+# Render's free tier spins down your backend after 15 minutes of inactivity.
+# This workflow pings the /api/health endpoint every 10 minutes (well within
+# the 15-min window) to keep the service warm and responsive.
+#
+# 📝 Setup:
+#   1. Push this file to your GitHub repo (any branch is fine).
+#   2. Go to your repo → Actions tab → enable workflows.
+#   3. The "Keep Backend Alive" workflow will start automatically.
+#
+# 🔧 To test it manually:
+#   Go to your repo → Actions → "Keep Backend Alive" → "Run workflow".
+#
+# 🔗 If you change your backend URL, update the URL below in the curl command.
+# ────────────────────────────────────────────────────────────────────────────
+
+name: Keep Backend Alive
+
+on:
+  schedule:
+    # Every 10 minutes — Render spins down after 15 min of inactivity,
+    # so 10 min gives us a safe buffer.
+    - cron: '*/10 * * * *'
+
+  # Allows you to trigger the workflow manually from the GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  ping:
+    name: Ping Render Backend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🏓 Ping /api/health
+        run: |
+          curl -sSf --max-time 15 -o /dev/null \
+            https://webpage-7jnn.onrender.com/api/health \
+            && echo "✅ Server responded successfully" \
+            || echo "⚠️ Ping failed — will retry in 10 minutes"

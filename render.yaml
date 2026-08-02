@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: cysecsphere-api
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_EMAIL
+        value: sawanyadav3010@gmail.com
+      - key: ADMIN_PASSWORD
+        value: sawan@#123
+      - key: NODE_ENV
+        value: "production"
+      - key: CORS_ORIGIN
+        value: "*" # change this to your deployed frontend URL after it's live
+      # CTF challenge flags — change these in Render's dashboard after deploy if needed.
+      - key: CTF_FLAG_1
+        value: CSPHERE{r0t_47_in_th3_sh4d0w}
+      - key: CTF_FLAG_2
+        value: CSPHERE{gh0st_1n_b1n4ry_w0rld}
+      - key: CTF_FLAG_3
+        value: CSPHERE{sql_1nj3ct10n_m4st3r}
+      - key: CTF_FLAG_4
+        value: CSPHERE{p4ck3t_sniff3r_pr0}
+      - key: CTF_FLAG_5
+        value: CSPHERE{h34p_0v3rfl0w_pwn3d}
+      - key: CTF_FLAG_6
+        value: CSPHERE{lsb_st3g0_h1dd3n_fl4g}
+    disk:
+      name: cysecsphere-data
+      mountPath: /opt/render/project/src/backend
+      sizeGB: 1
