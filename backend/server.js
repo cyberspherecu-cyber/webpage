@@ -7,6 +7,8 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const db = require('./db');
+const { ensureBucket } = require('./supabase');
+const { saveUpload, deleteUpload } = require('./uploads');
 const app = express();
 
 // In production, set CORS_ORIGIN to your deployed frontend's URL
@@ -15,36 +17,27 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 app.use(cors({ origin: CORS_ORIGIN }));
 app.use(express.json());
 
-// ─── FILE UPLOADS (event gallery photos) ──────────────────────────────────
-// Uploaded photos are saved to disk under backend/uploads/gallery and served
-// back out at /uploads/gallery/<filename>. On Render this directory lives on
-// the persistent disk (see render.yaml), so files survive restarts/redeploys.
-const UPLOADS_ROOT = path.join(__dirname, 'uploads');
-const GALLERY_UPLOADS_DIR = path.join(UPLOADS_ROOT, 'gallery');
-const CHALLENGE_UPLOADS_DIR = path.join(UPLOADS_ROOT, 'challenges');
-const EVENT_COVERS_DIR = path.join(UPLOADS_ROOT, 'event-covers');
-const TEAM_PHOTOS_DIR = path.join(UPLOADS_ROOT, 'team');
-fs.mkdirSync(GALLERY_UPLOADS_DIR, { recursive: true });
-fs.mkdirSync(CHALLENGE_UPLOADS_DIR, { recursive: true });
-fs.mkdirSync(EVENT_COVERS_DIR, { recursive: true });
-fs.mkdirSync(TEAM_PHOTOS_DIR, { recursive: true });
+// ─── FILE UPLOADS ─────────────────────────────────────────────────────────
+// Uploaded files (gallery photos, event covers, team photos, challenge files)
+// are parsed into memory by multer, then stored in Supabase Storage (see
+// uploads.js). The database stores the resulting public URL, so uploads
+// survive restarts/redeploys. Without Supabase credentials (local dev), files
+// fall back to disk under <DATA_DIR>/uploads, served at /uploads/....
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const UPLOADS_ROOT = path.join(DATA_DIR, 'uploads');
 app.use('/uploads', express.static(UPLOADS_ROOT));
 
-// ─── CHALLENGE FILES (downloadable binaries / zips for CTF participants) ──────
-const CHALLENGE_FILES_DIR = path.join(__dirname, 'challenge-files');
-fs.mkdirSync(CHALLENGE_FILES_DIR, { recursive: true });
+// Resolves a stored relative path (e.g. "/uploads/gallery/x.jpg") to an
+// absolute path — only used for the local-disk fallback.
+function uploadsPath(p) {
+  return path.join(UPLOADS_ROOT, String(p).replace(/^\/?uploads\//, ''));
+}
 
 const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
-const galleryStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, GALLERY_UPLOADS_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const safeExt = ['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext) ? ext : '';
-    cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${safeExt}`);
-  },
-});
-const galleryUpload = multer({
-  storage: galleryStorage,
+const memoryStorage = multer.memoryStorage();
+
+const imageUpload = multer({
+  storage: memoryStorage,
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
   fileFilter: (req, file, cb) => {
     if (!ALLOWED_IMAGE_TYPES.has(file.mimetype)) {
@@ -54,28 +47,16 @@ const galleryUpload = multer({
   },
 });
 
-// Team member profile photos — stored under uploads/team
-const teamPhotoStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, TEAM_PHOTOS_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const safeExt = ['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext) ? ext : '';
-    cb(null, `team-${req.params.id}-${Date.now()}${safeExt}`);
-  },
-});
-const teamPhotoUpload = multer({
-  storage: teamPhotoStorage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
-  fileFilter: (req, file, cb) => {
-    if (!ALLOWED_IMAGE_TYPES.has(file.mimetype)) {
-      return cb(new Error('Only JPG, PNG, GIF, or WEBP images are allowed.'));
-    }
-    cb(null, true);
-  },
+// Challenge files can be any type (text, binary, PCAP, etc.) up to 10MB.
+const challengeUpload = multer({
+  storage: memoryStorage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
 });
 
-function uploadTeamPhoto(req, res, next) {
-  teamPhotoUpload.single('photo')(req, res, (err) => {
+// Wraps multer's single-file upload so errors (wrong type, too large, etc.)
+// come back as a normal JSON error response instead of crashing the request.
+function uploadGalleryPhoto(req, res, next) {
+  imageUpload.single('photo')(req, res, (err) => {
     if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
       return res.status(400).json({ success: false, message: 'Photo must be under 5MB.' });
     }
@@ -86,44 +67,20 @@ function uploadTeamPhoto(req, res, next) {
   });
 }
 
-// ─── FILE UPLOADS (challenge files) ──────────────────────────────────────
-// Challenge files can be any type (text, binary, PCAP, etc.) up to 10MB.
-// The original extension is preserved.
-const challengeStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, CHALLENGE_UPLOADS_DIR),
-  filename: (req, file, cb) => {
-    const challengeId = req.params.id;
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `challenge-${challengeId}-${Date.now()}${ext}`);
-  },
-});
-const challengeUpload = multer({
-  storage: challengeStorage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-});
-
-// Event cover photos — stored under uploads/event-covers
-const eventCoverStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, EVENT_COVERS_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const safeExt = ['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext) ? ext : '';
-    cb(null, `event-${req.params.id}-${Date.now()}${safeExt}`);
-  },
-});
-const eventCoverUpload = multer({
-  storage: eventCoverStorage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
-  fileFilter: (req, file, cb) => {
-    if (!ALLOWED_IMAGE_TYPES.has(file.mimetype)) {
-      return cb(new Error('Only JPG, PNG, GIF, or WEBP images are allowed.'));
+function uploadTeamPhoto(req, res, next) {
+  imageUpload.single('photo')(req, res, (err) => {
+    if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ success: false, message: 'Photo must be under 5MB.' });
     }
-    cb(null, true);
-  },
-});
+    if (err) {
+      return res.status(400).json({ success: false, message: err.message || 'Upload failed.' });
+    }
+    next();
+  });
+}
 
 function uploadEventCover(req, res, next) {
-  eventCoverUpload.single('photo')(req, res, (err) => {
+  imageUpload.single('photo')(req, res, (err) => {
     if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
       return res.status(400).json({ success: false, message: 'Cover photo must be under 5MB.' });
     }
@@ -146,18 +103,10 @@ function uploadChallengeFile(req, res, next) {
   });
 }
 
-// Wraps multer's single-file upload so errors (wrong type, too large, etc.)
-// come back as a normal JSON error response instead of crashing the request.
-function uploadGalleryPhoto(req, res, next) {
-  galleryUpload.single('photo')(req, res, (err) => {
-    if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ success: false, message: 'Photo must be under 5MB.' });
-    }
-    if (err) {
-      return res.status(400).json({ success: false, message: err.message || 'Upload failed.' });
-    }
-    next();
-  });
+// Names uploaded images with a safe extension.
+function safeImageExt(originalname) {
+  const ext = path.extname(originalname || '').toLowerCase();
+  return ['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext) ? ext : '';
 }
 
 // ⚠️ Set JWT_SECRET in your .env / hosting provider's env vars in production.
@@ -177,10 +126,6 @@ const PORT = process.env.PORT || 5001;
 
 // Events are now stored in db.js and managed via admin CRUD endpoints.
 // Seed data lives in db.js DEFAULT_DATA.events.
-// Ensure existing event records have the coverPhoto field.
-db.ensureEventCoverPhotos();
-// Ensure the permanent Ghost Protocol challenge exists on the board.
-db.ensureGhostChallenge();
 
 // ─── AUTH ──────────────────────────────────────────────────────────────────
 
@@ -301,15 +246,39 @@ app.put('/api/auth/password', requireAuth, async (req, res) => {
   res.json({ success: true, message: 'Password updated successfully.' });
 });
 
-// Admin login (email + password, set via ADMIN_EMAIL & ADMIN_PASSWORD env vars)
+// Admin login — the admin account lives in the database (seeded from
+// ADMIN_EMAIL/ADMIN_PASSWORD env vars on first boot, see bootstrap below).
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'sawanyadav3010@gmail.com';
-app.post('/api/admin/login', (req, res) => {
+app.post('/api/admin/login', async (req, res) => {
   const { email, password } = req.body;
-  if (!email || !password || email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
+  if (!email || !password) {
+    return res.status(400).json({ success: false, message: 'Email and password are required.' });
+  }
+  const admin = db.findAdminByEmail(email);
+  if (!admin || !(await bcrypt.compare(password, admin.passwordHash))) {
     return res.status(401).json({ success: false, message: 'Invalid admin credentials.' });
   }
-  const token = jwt.sign({ role: 'admin', username: 'admin', email: ADMIN_EMAIL }, JWT_SECRET, { expiresIn: '1d' });
-  res.json({ success: true, token, email: ADMIN_EMAIL });
+  const token = jwt.sign({ role: 'admin', username: 'admin', email: admin.email }, JWT_SECRET, { expiresIn: '1d' });
+  res.json({ success: true, token, email: admin.email });
+});
+
+// Change the admin password (requires an admin token — verifies the current
+// password, then stores the new one in the database).
+app.put('/api/admin/password', requireAdmin, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ success: false, message: 'Current and new passwords are required.' });
+  }
+  if (newPassword.length < 8) {
+    return res.status(400).json({ success: false, message: 'New password must be at least 8 characters.' });
+  }
+  const admin = db.findAdminByEmail(req.user.email);
+  if (!admin) return res.status(404).json({ success: false, message: 'Admin account not found.' });
+  const valid = await bcrypt.compare(currentPassword, admin.passwordHash);
+  if (!valid) return res.status(401).json({ success: false, message: 'Current password is incorrect.' });
+  const passwordHash = await bcrypt.hash(newPassword, 10);
+  db.updateAdminPassword(admin.id, passwordHash);
+  res.json({ success: true, message: 'Admin password updated successfully.' });
 });
 
 // ─── API ROUTES ───────────────────────────────────────────────────────────────
@@ -363,9 +332,13 @@ app.get('/api/challenges/:id/download', (req, res) => {
   if (!challenge || !challenge.fileUrl) {
     return res.status(404).json({ success: false, message: 'No file available for this challenge.' });
   }
-  const filePath = path.join(__dirname, challenge.fileUrl);
+  // Files stored in Supabase Storage are served straight from their public URL
+  if (/^https?:\/\//i.test(challenge.fileUrl)) {
+    return res.redirect(challenge.fileUrl);
+  }
+  const filePath = uploadsPath(challenge.fileUrl);
   const resolved = path.resolve(filePath);
-  const allowed = path.resolve(__dirname, 'uploads');
+  const allowed = path.resolve(UPLOADS_ROOT);
   if (!resolved.startsWith(allowed)) {
     return res.status(403).json({ success: false, message: 'Invalid file path.' });
   }
@@ -577,28 +550,28 @@ app.delete('/api/admin/event-registrations/:id', requireAdmin, (req, res) => {
 });
 
 // Event photo gallery ("glimpses") — admin uploads a photo file for a specific event
-app.post('/api/admin/gallery', requireAdmin, uploadGalleryPhoto, (req, res) => {
+app.post('/api/admin/gallery', requireAdmin, uploadGalleryPhoto, async (req, res) => {
   const { eventId, label, accent } = req.body;
   if (!eventId || !label || !req.file) {
     return res.status(400).json({ success: false, message: 'Event, label, and a photo file are required.' });
   }
   const event = db.getEventById(Number(eventId));
-  if (!event) {
-    fs.unlink(req.file.path, () => {});
-    return res.status(404).json({ success: false, message: 'Event not found.' });
+  if (!event) return res.status(404).json({ success: false, message: 'Event not found.' });
+  try {
+    const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}${safeImageExt(req.file.originalname)}`;
+    const photo = await saveUpload({ buffer: req.file.buffer, contentType: req.file.mimetype, subdir: 'gallery', filename });
+    const item = db.addGalleryPhoto({ eventId: Number(eventId), label, photo, accent });
+    res.json({ success: true, item: { ...item, eventTitle: event.title } });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
-  const photoPath = `/uploads/gallery/${req.file.filename}`;
-  const item = db.addGalleryPhoto({ eventId: Number(eventId), label, photo: photoPath, accent });
-  res.json({ success: true, item: { ...item, eventTitle: event.title } });
 });
 
-app.delete('/api/admin/gallery/:id', requireAdmin, (req, res) => {
+app.delete('/api/admin/gallery/:id', requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   const item = db.getGalleryPhotoById(id);
   const ok = db.deleteGalleryPhoto(id);
-  if (ok && item && item.photo && item.photo.startsWith('/uploads/')) {
-    fs.unlink(path.join(__dirname, item.photo), () => {}); // best-effort cleanup, ignore errors
-  }
+  if (ok && item && item.photo) await deleteUpload(item.photo); // best-effort cleanup
   res.json({ success: ok });
 });
 
@@ -648,33 +621,28 @@ app.put('/api/admin/events/:id', requireAdmin, (req, res) => {
 });
 
 // Upload a cover photo for an event (replaces any existing cover)
-app.post('/api/admin/events/:id/cover', requireAdmin, uploadEventCover, (req, res) => {
-  const id = Number(req.params.id);
-  const event = db.getEventById(id);
-  if (!event) {
-    if (req.file) fs.unlink(req.file.path, () => {});
-    return res.status(404).json({ success: false, message: 'Event not found.' });
-  }
-  if (!req.file) {
-    return res.status(400).json({ success: false, message: 'No photo provided.' });
-  }
-  // Clean up old cover if it was a local upload
-  if (event.coverPhoto && event.coverPhoto.startsWith('/uploads/event-covers/')) {
-    fs.unlink(path.join(__dirname, event.coverPhoto), () => {});
-  }
-  const coverPhoto = `/uploads/event-covers/${req.file.filename}`;
-  db.updateEvent(id, { coverPhoto });
-  res.json({ success: true, coverPhoto, message: 'Cover photo uploaded.' });
-});
-
-// Remove an event's cover photo
-app.delete('/api/admin/events/:id/cover', requireAdmin, (req, res) => {
+app.post('/api/admin/events/:id/cover', requireAdmin, uploadEventCover, async (req, res) => {
   const id = Number(req.params.id);
   const event = db.getEventById(id);
   if (!event) return res.status(404).json({ success: false, message: 'Event not found.' });
-  if (event.coverPhoto && event.coverPhoto.startsWith('/uploads/event-covers/')) {
-    fs.unlink(path.join(__dirname, event.coverPhoto), () => {});
+  if (!req.file) return res.status(400).json({ success: false, message: 'No photo provided.' });
+  try {
+    if (event.coverPhoto) await deleteUpload(event.coverPhoto);
+    const filename = `event-${id}-${Date.now()}${safeImageExt(req.file.originalname)}`;
+    const coverPhoto = await saveUpload({ buffer: req.file.buffer, contentType: req.file.mimetype, subdir: 'event-covers', filename });
+    db.updateEvent(id, { coverPhoto });
+    res.json({ success: true, coverPhoto, message: 'Cover photo uploaded.' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
+});
+
+// Remove an event's cover photo
+app.delete('/api/admin/events/:id/cover', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  const event = db.getEventById(id);
+  if (!event) return res.status(404).json({ success: false, message: 'Event not found.' });
+  if (event.coverPhoto) await deleteUpload(event.coverPhoto);
   db.updateEvent(id, { coverPhoto: null });
   res.json({ success: true, message: 'Cover photo removed.' });
 });
@@ -740,37 +708,33 @@ app.delete('/api/admin/challenges/:id', requireAdmin, (req, res) => {
 });
 
 // Upload a file for a challenge (replaces any existing file)
-app.post('/api/admin/challenges/:id/upload', requireAdmin, uploadChallengeFile, (req, res) => {
+app.post('/api/admin/challenges/:id/upload', requireAdmin, uploadChallengeFile, async (req, res) => {
   const id = Number(req.params.id);
   const challenge = db.getChallengeById(id);
-  if (!challenge) {
-    if (req.file) fs.unlink(req.file.path, () => {});
-    return res.status(404).json({ success: false, message: 'Challenge not found.' });
-  }
-  if (!req.file) {
-    return res.status(400).json({ success: false, message: 'No file provided.' });
-  }
+  if (!challenge) return res.status(404).json({ success: false, message: 'Challenge not found.' });
+  if (!req.file) return res.status(400).json({ success: false, message: 'No file provided.' });
 
-  // Clean up old file if it exists
-  if (challenge.fileUrl) {
-    const oldPath = path.join(__dirname, challenge.fileUrl);
-    fs.unlink(oldPath, () => {}); // best-effort
+  // Clean up the previous file, then store the new one
+  try {
+    if (challenge.fileUrl) await deleteUpload(challenge.fileUrl);
+    const ext = path.extname(req.file.originalname || '').toLowerCase();
+    const filename = `challenge-${id}-${Date.now()}${ext}`;
+    const fileUrl = await saveUpload({ buffer: req.file.buffer, contentType: req.file.mimetype, subdir: 'challenges', filename });
+    db.updateChallenge(id, { fileUrl });
+    res.json({ success: true, fileUrl, filename: req.file.originalname, message: 'File uploaded successfully.' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
-
-  const fileUrl = `uploads/challenges/${req.file.filename}`;
-  db.updateChallenge(id, { fileUrl });
-  res.json({ success: true, fileUrl, filename: req.file.originalname, message: 'File uploaded successfully.' });
 });
 
 // Delete a challenge's uploaded file (doesn't delete the challenge itself)
-app.delete('/api/admin/challenges/:id/file', requireAdmin, (req, res) => {
+app.delete('/api/admin/challenges/:id/file', requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   const challenge = db.getChallengeById(id);
   if (!challenge || !challenge.fileUrl) {
     return res.status(404).json({ success: false, message: 'No file to delete for this challenge.' });
   }
-  const filePath = path.join(__dirname, challenge.fileUrl);
-  fs.unlink(filePath, () => {}); // best-effort
+  await deleteUpload(challenge.fileUrl);
   db.updateChallenge(id, { fileUrl: null });
   res.json({ success: true, message: 'Challenge file deleted.' });
 });
@@ -897,45 +861,37 @@ app.put('/api/admin/team/:id', requireAdmin, (req, res) => {
   res.json({ success: true, member: updated });
 });
 
-app.delete('/api/admin/team/:id', requireAdmin, (req, res) => {
+app.delete('/api/admin/team/:id', requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   const member = db.getTeamMemberById(id);
-  // Best-effort cleanup of the member's uploaded photo file
-  if (member && member.photo && member.photo.startsWith('/uploads/team/')) {
-    fs.unlink(path.join(__dirname, member.photo), () => {});
-  }
+  if (member && member.photo) await deleteUpload(member.photo); // best-effort cleanup
   const ok = db.deleteTeamMember(id);
   res.json({ success: ok, message: ok ? 'Member deleted.' : 'Member not found.' });
 });
 
 // Upload / replace a team member's profile photo
-app.post('/api/admin/team/:id/photo', requireAdmin, uploadTeamPhoto, (req, res) => {
-  const id = Number(req.params.id);
-  const member = db.getTeamMemberById(id);
-  if (!member) {
-    if (req.file) fs.unlink(req.file.path, () => {});
-    return res.status(404).json({ success: false, message: 'Member not found.' });
-  }
-  if (!req.file) {
-    return res.status(400).json({ success: false, message: 'No photo provided.' });
-  }
-  // Clean up the previous photo if it was a local upload
-  if (member.photo && member.photo.startsWith('/uploads/team/')) {
-    fs.unlink(path.join(__dirname, member.photo), () => {});
-  }
-  const photo = `/uploads/team/${req.file.filename}`;
-  const updated = db.updateTeamMember(id, { photo });
-  res.json({ success: true, member: updated, message: 'Profile photo uploaded.' });
-});
-
-// Remove a team member's profile photo (falls back to the letter avatar)
-app.delete('/api/admin/team/:id/photo', requireAdmin, (req, res) => {
+app.post('/api/admin/team/:id/photo', requireAdmin, uploadTeamPhoto, async (req, res) => {
   const id = Number(req.params.id);
   const member = db.getTeamMemberById(id);
   if (!member) return res.status(404).json({ success: false, message: 'Member not found.' });
-  if (member.photo && member.photo.startsWith('/uploads/team/')) {
-    fs.unlink(path.join(__dirname, member.photo), () => {});
+  if (!req.file) return res.status(400).json({ success: false, message: 'No photo provided.' });
+  try {
+    if (member.photo) await deleteUpload(member.photo);
+    const filename = `team-${id}-${Date.now()}${safeImageExt(req.file.originalname)}`;
+    const photo = await saveUpload({ buffer: req.file.buffer, contentType: req.file.mimetype, subdir: 'team', filename });
+    const updated = db.updateTeamMember(id, { photo });
+    res.json({ success: true, member: updated, message: 'Profile photo uploaded.' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
+});
+
+// Remove a team member's profile photo (falls back to the letter avatar)
+app.delete('/api/admin/team/:id/photo', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  const member = db.getTeamMemberById(id);
+  if (!member) return res.status(404).json({ success: false, message: 'Member not found.' });
+  if (member.photo) await deleteUpload(member.photo);
   const updated = db.updateTeamMember(id, { photo: null });
   res.json({ success: true, member: updated, message: 'Profile photo removed.' });
 });
@@ -1235,4 +1191,25 @@ app.get('/api/ghost-completions', (req, res) => {
   res.json({ success: true, count: db.getGhostCompletionCount(), completions });
 });
 
-app.listen(PORT, () => console.log(`🔐 Cysecsphere API running on port ${PORT}`));
+// ─── BOOTSTRAP ─────────────────────────────────────────────────────────────
+// Load the dataset from Supabase (auto-creating and seeding the table on first
+// boot), make sure the storage bucket exists, then start serving. Everything
+// must be ready before requests arrive so the in-memory cache is populated.
+(async () => {
+  try {
+    await db.init();
+    await ensureBucket();
+    db.ensureEventCoverPhotos();
+    db.ensureGhostChallenge();
+    // Seed the initial admin account from env vars on first boot — afterwards
+    // the admin account is managed entirely through the database.
+    if (db.getAllAdmins().length === 0) {
+      await db.createAdmin({ email: ADMIN_EMAIL, passwordHash: await bcrypt.hash(ADMIN_PASSWORD, 10) });
+      console.log('🌱 Seeded initial admin account from env vars.');
+    }
+    app.listen(PORT, () => console.log(`🔐 Cysecsphere API running on port ${PORT}`));
+  } catch (err) {
+    console.error('❌ Failed to start server:', err);
+    process.exit(1);
+  }
+})();

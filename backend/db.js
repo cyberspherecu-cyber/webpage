@@ -1,15 +1,49 @@
 const fs = require('fs');
 const path = require('path');
+const { Pool } = require('pg');
+const { supabase, supabaseConfigured } = require('./supabase');
 
-// ─── SIMPLE FILE-BASED DATABASE ────────────────────────────────────────────
-// No external DB server or native dependencies required — everything is
-// persisted to a single JSON file on disk (data.db.json). This is enough
-// for a club-scale app. To upgrade later to SQLite/Postgres/MongoDB, only
-// the functions in this file need to change — server.js just calls these.
+// ─── SUPABASE POSTGRES DATABASE ────────────────────────────────────────────
+// All app data is persisted to a single key/value table (cysec_data) in
+// Supabase Postgres. On startup the whole table is loaded into memory and all
+// reads happen from there; every mutation is written through to Supabase via
+// an ordered write queue. This keeps the rest of the module simple while
+// making every admin edit, signup, and upload survive restarts and redeploys.
+//
+// Two ways to connect — either is enough:
+//   • DATABASE_URL (Postgres connection string) — the table is created
+//     automatically on first boot.
+//   • SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY only — no database password
+//     needed; the app talks to the table over Supabase's REST API. The table
+//     just has to exist: on first boot the app prints the one-line SQL to run
+//     in the Supabase SQL Editor.
+//
+// If neither is set (plain local dev), the module falls back to the original
+// JSON-file storage (data.db.json) so the app still runs without any cloud
+// credentials.
 
-const DB_PATH = path.join(__dirname, 'data.db.json');
+const USE_PG = Boolean(process.env.DATABASE_URL);
+const USE_SUPABASE = USE_PG || supabaseConfigured;
+const TABLE = 'cysec_data';
+
+let pool = null;
+if (USE_PG) {
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    // Supabase requires TLS. If the URL already carries sslmode, let pg parse
+    // it; otherwise enable TLS explicitly (relaxed validation for the
+    // self-signed leaf on Supabase's pooler).
+    ssl: /sslmode/.test(process.env.DATABASE_URL)
+      ? undefined
+      : { rejectUnauthorized: false },
+  });
+}
+
+// Fallback file location (only used when no Supabase credentials are set).
+const FS_PATH = path.join(process.env.DATA_DIR || __dirname, 'data.db.json');
 
 const DEFAULT_DATA = {
+  admins: [],          // Admin accounts: { id, email, passwordHash, createdAt } — seeded from env vars on first boot, then DB-managed
   users: [],           // CTF accounts: { id, username, email, passwordHash, college, joinedAt }
   submissions: [],      // CTF flag submissions: { id, username, challengeId, correct, timestamp }
   challengeStats: {},   // { [challengeId]: solvedCount }
@@ -146,26 +180,155 @@ const DEFAULT_DATA = {
   ],
 };
 
-function load() {
-  if (!fs.existsSync(DB_PATH)) {
-    save(DEFAULT_DATA);
-    return { ...DEFAULT_DATA };
-  }
-  try {
-    const raw = fs.readFileSync(DB_PATH, 'utf-8');
-    return { ...DEFAULT_DATA, ...JSON.parse(raw) };
-  } catch (err) {
-    console.error('⚠️  Failed to read data.db.json, starting fresh:', err.message);
-    return { ...DEFAULT_DATA };
+// ─── PERSISTENCE LAYER ─────────────────────────────────────────────────────
+
+// Direct Postgres connection (DATABASE_URL) — table is auto-created.
+async function ensureTablePg() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS ${TABLE} (key text PRIMARY KEY, value jsonb NOT NULL)`);
+}
+
+async function readAllPg() {
+  const { rows } = await pool.query(`SELECT key, value FROM ${TABLE}`);
+  const stored = {};
+  for (const r of rows) stored[r.key] = r.value;
+  return stored;
+}
+
+async function writeAllPg(snapshot) {
+  const entries = Object.entries(snapshot);
+  for (const [key, value] of entries) {
+    await pool.query(
+      `INSERT INTO ${TABLE} (key, value) VALUES ($1, $2::jsonb)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [key, JSON.stringify(value)]
+    );
   }
 }
+
+// Supabase REST API (service role key) — no database password needed. If the
+// table doesn't exist yet, print the exact SQL to run once in the SQL Editor.
+const PROJECT_REF = (process.env.SUPABASE_URL || '').replace(/^https?:\/\//, '').split('.')[0];
+
+async function ensureTableRest() {
+  const { error } = await supabase.from(TABLE).select('key').limit(1);
+  if (error && /does not exist|42P01|relation|PGRST205|Could not find the table|schema cache/i.test(`${error.message} ${error.code}`)) {
+    const sql = `CREATE TABLE IF NOT EXISTS ${TABLE} (key text PRIMARY KEY, value jsonb NOT NULL);`;
+    console.error(`❌ The "${TABLE}" table does not exist in your Supabase project yet.`);
+    console.error(`   Run this one line in the Supabase SQL Editor (https://supabase.com/dashboard/project/${PROJECT_REF}/sql/new):`);
+    console.error(`   ${sql}`);
+    throw new Error(`Missing Supabase table "${TABLE}" — run the SQL snippet above, then restart.`);
+  }
+  if (error) throw error;
+}
+
+async function readAllRest() {
+  const { data, error } = await supabase.from(TABLE).select('key, value');
+  if (error) throw error;
+  const stored = {};
+  for (const r of data || []) stored[r.key] = r.value;
+  return stored;
+}
+
+async function writeAllRest(snapshot) {
+  const rows = Object.entries(snapshot).map(([key, value]) => ({ key, value }));
+  const { error } = await supabase.from(TABLE).upsert(rows, { onConflict: 'key' });
+  if (error) throw error;
+}
+
+async function ensureTable() { return USE_PG ? ensureTablePg() : ensureTableRest(); }
+async function readAll() { return USE_PG ? readAllPg() : readAllRest(); }
+async function writeAll(snapshot) { return USE_PG ? writeAllPg(snapshot) : writeAllRest(snapshot); }
+
+function loadFromFile() {
+  try {
+    return JSON.parse(fs.readFileSync(FS_PATH, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+function saveToFile(data) {
+  fs.mkdirSync(path.dirname(FS_PATH), { recursive: true });
+  fs.writeFileSync(FS_PATH, JSON.stringify(data, null, 2));
+}
+
+// Persists a snapshot of the whole dataset. With Supabase, writes are queued
+// so rapid mutations can't interleave and lose data. The snapshot is taken at
+// call time so each queued write reflects the state it was triggered from.
+let writeQueue = Promise.resolve();
 
 function save(data) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
+  if (!USE_SUPABASE) {
+    saveToFile(data);
+    return;
+  }
+  const snapshot = JSON.parse(JSON.stringify(data));
+  writeQueue = writeQueue
+    .then(() => writeAll(snapshot))
+    .catch((err) => console.error('⚠️  Failed to persist to Supabase:', err.message));
 }
 
-// In-memory cache of the file contents, kept in sync on every write.
-let db = load();
+// Loads the dataset into memory. Call once at startup (server.js) before
+// accepting requests. Seeds the default data on first boot.
+async function init() {
+  if (USE_SUPABASE) {
+    await ensureTable();
+    const stored = await readAll();
+    db = { ...DEFAULT_DATA, ...stored };
+    if (Object.keys(stored).length === 0) {
+      await writeAll(db); // first boot — persist the defaults
+      console.log('🌱 Seeded Supabase with default site data.');
+    }
+  } else {
+    const stored = loadFromFile();
+    db = stored ? { ...DEFAULT_DATA, ...stored } : { ...DEFAULT_DATA };
+    if (!stored) saveToFile(db);
+  }
+}
+
+// In-memory cache of the dataset, kept in sync on every write.
+let db = { ...DEFAULT_DATA };
+
+
+// ─── ADMINS (stored in the database) ──────────────────────────────────────
+// The first admin is seeded from ADMIN_EMAIL/ADMIN_PASSWORD env vars at
+// startup (see server.js); afterwards the admin account lives entirely in
+// the database.
+
+function getAllAdmins() {
+  return db.admins || [];
+}
+
+function findAdminByEmail(email) {
+  return (db.admins || []).find(a => a.email.toLowerCase() === (email || '').toLowerCase());
+}
+
+function createAdmin({ email, passwordHash }) {
+  if (!db.admins) db.admins = [];
+  const admin = {
+    id: (db.admins.length ? Math.max(...db.admins.map(a => a.id)) : 0) + 1,
+    email: String(email || '').trim().toLowerCase(),
+    passwordHash,
+    createdAt: new Date().toISOString(),
+  };
+  db.admins.push(admin);
+  save(db);
+  return admin;
+}
+
+// Update an admin's password hash (by id or email). Returns the updated admin
+// without the hash, or null if not found. Used by the change-password endpoint
+// and by setup scripts to sync the admin account to an intended password.
+function updateAdminPassword(identifier, passwordHash) {
+  const idx = (db.admins || []).findIndex(
+    a => a.id === identifier || a.email.toLowerCase() === String(identifier || '').toLowerCase()
+  );
+  if (idx === -1) return null;
+  db.admins[idx].passwordHash = passwordHash;
+  save(db);
+  const { passwordHash: _h, ...safe } = db.admins[idx];
+  return safe;
+}
 
 // ─── USERS ──────────────────────────────────────────────────────────────────
 
@@ -1116,6 +1279,11 @@ function deleteResource(id) {
 }
 
 module.exports = {
+  init,
+  getAllAdmins,
+  findAdminByEmail,
+  createAdmin,
+  updateAdminPassword,
   findUserByUsernameOrEmail,
   findUserByUsername,
   findUserById,

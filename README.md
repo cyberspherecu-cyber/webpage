@@ -60,7 +60,19 @@ The frontend and backend are two separate deployments: a **static site** (fronte
 
 **Other options:** Railway, Fly.io, or any host that runs a persistent Node process work the same way — set the same three env vars (`PORT` is usually auto-set by the platform) and use `node server.js` as the start command.
 
-> **⚠️ Important — data persistence:** This project stores data in a JSON file on disk (`backend/data.db.json`), not a hosted database. That only survives restarts/deploys if your host gives the service a **persistent disk** (the `render.yaml` blueprint requests one). On platforms with an *ephemeral* filesystem (e.g. Vercel serverless functions, plain Heroku dynos), that file is wiped on every restart/deploy — fine for a demo, not for real accounts. For serious production use, swap `backend/db.js` for a real database (Postgres, MongoDB, etc.) — it's the only file that would need to change, since `server.js` only calls its exported functions.
+> **✅ Data persistence (Supabase):** The backend stores all data (site content, events, challenges, signups, leaderboards, blog posts, …) in **Supabase Postgres** and all uploaded files in **Supabase Storage**, so admin edits and uploads survive restarts, redeploys, and scale-to-zero — no persistent disk required. Set these env vars on your host (they're already in `render.yaml`):
+> - `SUPABASE_URL` — Project Settings → **API** → Project URL
+> - `SUPABASE_SERVICE_ROLE_KEY` — Project Settings → **API** → secret key (server-side, bypasses RLS)
+>
+> The app talks to Supabase over its REST API with the secret key, so **no Postgres connection string is needed**. One-time setup: run this SQL in the Supabase **SQL Editor** so the app has a place to store its data:
+> ```sql
+> CREATE TABLE IF NOT EXISTS cysec_data (key text PRIMARY KEY, value jsonb NOT NULL);
+> ```
+> (If the table is missing, the app refuses to start and prints this exact line with a link to your SQL Editor.) The `uploads` storage bucket is created automatically on first boot, and the default site data is seeded automatically.
+>
+> **Optional:** if you provide a `DATABASE_URL` (Project Settings → Database → Connection string) the app creates the table automatically on first boot instead of needing the SQL step — but note direct connections are IPv6-only unless Supabase's paid IPv4 add-on is enabled.
+>
+> **Local dev without any of these env vars still works** — the backend falls back to the original `data.db.json` file + local `uploads/` folder.
 
 ### Frontend → Vercel or Netlify (either works well for a Vite app)
 
@@ -94,7 +106,13 @@ This restricts the API to only accept requests from your actual site instead of 
 | `PORT` | Port the API listens on | `5000` |
 | `JWT_SECRET` | Signs login tokens — must be a long random string in production | dev placeholder (change this!) |
 | `CORS_ORIGIN` | Which origin(s) may call the API | `*` |
-| `ADMIN_PASSWORD` | Password for the `/admin` dashboard | `admin123` (change this!) |
+| `ADMIN_EMAIL` | Email for the `/admin` dashboard login | `sawanyadav3010@gmail.com` |
+| `ADMIN_PASSWORD` | Password used to seed the admin account on **first boot only** | `CyberSphere@2025` (change this!) |
+| `SUPABASE_URL` | Your Supabase project URL (Project Settings → API) | *(unset → local file fallback)* |
+| `SUPABASE_SERVICE_ROLE_KEY` | Supabase secret key (server-side, bypasses RLS) | *(unset → local file fallback)* |
+| `DATABASE_URL` | *(optional)* Supabase Postgres connection string — auto-creates the data table on first boot | *(unset → use the one-line SQL setup instead)* |
+
+When `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set, the app persists everything to Supabase (table must exist — see the one-time SQL above). Without them, the original `data.db.json` file is used so local dev keeps working.
 
 **`frontend/.env`**
 | Variable | Purpose | Default |
@@ -113,7 +131,12 @@ A dashboard at **`/admin`** (linked quietly at the bottom of the site footer) le
 - Event RSVPs
 - Live stats (member count, CTF accounts, RSVPs, flags captured)
 
-It's protected by a single shared password, set via `ADMIN_PASSWORD` in `backend/.env`. **Change this from the default (`admin123`) before deploying** — the server logs a warning if you don't. If you use the `render.yaml` blueprint, Render generates a random one for you automatically (find it in the service's Environment tab after deploy).
+It's protected by an **admin account stored in the database** — seeded once from `ADMIN_EMAIL`/`ADMIN_PASSWORD` on first boot, then managed entirely in the DB (Supabase table or `data.db.json`). Changing `ADMIN_PASSWORD` in the env later does **not** update an already-seeded account; update it in the database instead:
+
+- **From the app:** `PUT /api/admin/password` with `{ currentPassword, newPassword }` (requires an admin token).
+- **From a script:** `db.updateAdminPassword(email, newPasswordHash)` (see `backend/db.js`).
+
+If you use the `render.yaml` blueprint, the admin is seeded with the `ADMIN_PASSWORD` value you set there. ⚠️ Change the default before going live — the server logs a warning if `ADMIN_PASSWORD` is unset.
 
 ---
 
