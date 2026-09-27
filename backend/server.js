@@ -11,6 +11,10 @@ const { ensureBucket } = require('./supabase');
 const { saveUpload, deleteUpload } = require('./uploads');
 const app = express();
 
+// Behind Render's reverse proxy — makes req.ip the real client IP so the
+// rate limiter keys buckets per user instead of per proxy.
+app.set('trust proxy', 1);
+
 // In production, set CORS_ORIGIN to your deployed frontend's URL
 // (e.g. https://cysecsphere.vercel.app). Defaults to "*" for local dev.
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
@@ -140,7 +144,50 @@ function attachUser(req, res, next) {
   }
   next();
 }
+
+// Middleware: runs the automatic weekly challenge reset. Fires on every
+// request — once the week is current it's just a date comparison. If the
+// server was down across a Monday boundary, the reset happens on the first
+// request after boot (exactly once, restart-safe).
+function weeklyReset(req, res, next) {
+  try {
+    const result = db.maybeRunWeeklyReset();
+    if (result) console.log(`🔄 Weekly challenge reset for week of ${result.weekLabel} (cleared ${result.cleared}).`);
+  } catch (err) {
+    console.error('⚠️  Weekly reset failed:', err.message);
+  }
+  next();
+}
+
 app.use(attachUser);
+app.use(weeklyReset);
+
+// ─── SIMPLE RATE LIMITER (in-memory, no external dependency) ───────────────
+// Fixed-window limiter keyed by IP. Protects auth and flag-submission
+// endpoints from brute-force abuse. For multi-instance deployments swap in a
+// shared store (e.g. Redis); a single Render instance is fine with this.
+const rateBuckets = new Map();
+function rateLimit({ windowMs = 60_000, max = 10, key = 'global' } = {}) {
+  return (req, res, next) => {
+    const now = Date.now();
+    const bucketKey = `${key}:${req.ip}`;
+    const bucket = rateBuckets.get(bucketKey);
+    if (!bucket || now > bucket.resetAt) {
+      rateBuckets.set(bucketKey, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    bucket.count += 1;
+    if (bucket.count > max) {
+      return res.status(429).json({ success: false, message: 'Too many requests. Slow down and try again shortly.' });
+    }
+    next();
+  };
+}
+// Periodically purge expired buckets so the map doesn't grow unbounded.
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, b] of rateBuckets) if (now > b.resetAt) rateBuckets.delete(k);
+}, 5 * 60_000).unref();
 
 // Middleware: requires a valid token
 function requireAuth(req, res, next) {
@@ -157,7 +204,7 @@ function requireAdmin(req, res, next) {
 }
 
 // Sign up for a CTF account
-app.post('/api/auth/signup', async (req, res) => {
+app.post('/api/auth/signup', rateLimit({ windowMs: 10 * 60_000, max: 20, key: 'signup' }), async (req, res) => {
   const { username, email, password, college } = req.body;
   if (!username || !email || !password) {
     return res.status(400).json({ success: false, message: 'Username, email, and password are required.' });
@@ -178,7 +225,7 @@ app.post('/api/auth/signup', async (req, res) => {
 });
 
 // Log in to an existing CTF account
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', rateLimit({ windowMs: 10 * 60_000, max: 20, key: 'login' }), async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
     return res.status(400).json({ success: false, message: 'Username and password are required.' });
@@ -249,7 +296,7 @@ app.put('/api/auth/password', requireAuth, async (req, res) => {
 // Admin login — the admin account lives in the database (seeded from
 // ADMIN_EMAIL/ADMIN_PASSWORD env vars on first boot, see bootstrap below).
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'sawanyadav3010@gmail.com';
-app.post('/api/admin/login', async (req, res) => {
+app.post('/api/admin/login', rateLimit({ windowMs: 10 * 60_000, max: 10, key: 'admin-login' }), async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ success: false, message: 'Email and password are required.' });
@@ -367,7 +414,7 @@ app.get('/api/leaderboard/weekly', (req, res) => {
 });
 
 // Submit flag (requires a logged-in CTF account — flags read from db)
-app.post('/api/submit-flag', requireAuth, (req, res) => {
+app.post('/api/submit-flag', rateLimit({ windowMs: 60_000, max: 30, key: 'flag' }), requireAuth, (req, res) => {
   // Normalize challengeId to a number to avoid strict-equality type mismatches
   const challengeId = Number(req.body.challengeId);
   const flag = req.body.flag;
@@ -450,7 +497,7 @@ app.post('/api/members/register', (req, res) => {
 
 // ─── ADMIN ──────────────────────────────────────────────────────────────────
 
-// Summary counts for the admin dashboard
+// Summary counts for the admin dashboard (plus current week info)
 app.get('/api/admin/stats', requireAdmin, (req, res) => {
   res.json({
     members: db.getAllMembers().length,
@@ -464,6 +511,7 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
     teamMembers: db.getAllTeamMembers().length,
     resources: db.getAllResources().length,
     blogPosts: db.getAllBlogPosts().length,
+    week: db.getCurrentWeekInfo(),
   });
 });
 
@@ -739,25 +787,18 @@ app.delete('/api/admin/challenges/:id/file', requireAdmin, async (req, res) => {
   res.json({ success: true, message: 'Challenge file deleted.' });
 });
 
-// Archive challenges (reset for a new week) — moves current challenges to archive and clears the board
-app.post('/api/admin/challenges/reset', requireAdmin, (req, res) => {
-  const result = db.archiveChallenges();
-  if (result.archived) {
-    res.json({
-      success: true,
-      message: `Archived ${result.count} challenges for week "${result.weekLabel}". Ready for new challenges!`,
-      weekLabel: result.weekLabel,
-      count: result.count,
-    });
-  } else {
-    res.json({ success: false, message: result.message });
-  }
-});
-
-// Get archived challenge sets (previous weekly archives)
-app.get('/api/admin/challenges/archive', requireAdmin, (req, res) => {
-  const archives = db.getArchivedChallenges();
-  res.json(archives);
+// ─── WEEKLY CHALLENGE CYCLE ─────────────────────────────────────────────
+// The archive feature has been removed. The board resets automatically every
+// Monday at 00:00 (server time) — see maybeRunWeeklyReset() in db.js, which
+// runs as middleware below. This endpoint only lets an admin start the new
+// week early; nothing is archived, no data is lost.
+app.post('/api/admin/challenges/reset-week', requireAdmin, (req, res) => {
+  const result = db.runWeeklyReset();
+  res.json({
+    success: true,
+    message: `Week reset — cleared ${result.cleared} challenge${result.cleared !== 1 ? 's' : ''}. The board is ready for the new week (permanent challenges stay up).`,
+    week: db.getCurrentWeekInfo(),
+  });
 });
 
 // ─── BLOG / ANNOUNCEMENTS ──────────────────────────────────────────────
@@ -971,7 +1012,7 @@ app.get('/api/personal-ctf', (req, res) => {
 });
 
 // Join a personal CTF with accessId + accessPassword
-app.post('/api/personal-ctf/join', requireAuth, (req, res) => {
+app.post('/api/personal-ctf/join', rateLimit({ windowMs: 60_000, max: 15, key: 'pctf-join' }), requireAuth, (req, res) => {
   const { accessId, accessPassword } = req.body;
   if (!accessId || !accessPassword) {
     return res.status(400).json({ success: false, message: 'Access ID and password are required.' });
@@ -1201,6 +1242,13 @@ app.get('/api/ghost-completions', (req, res) => {
     await ensureBucket();
     db.ensureEventCoverPhotos();
     db.ensureGhostChallenge();
+    // One-time migration from the removed archive feature: put any archived
+    // challenges back on the regular board, then delete the archive store.
+    const restored = db.restoreArchivedChallenges();
+    if (restored.restored > 0) console.log(`♻️  Restored ${restored.restored} archived challenge(s) to the regular board.`);
+    // Run the automatic weekly rollover if the calendar week changed while down.
+    const reset = db.maybeRunWeeklyReset();
+    if (reset) console.log(`🔄 Weekly challenge rollover applied for week of ${reset.weekLabel} (cleared ${reset.cleared}).`);
     // Seed the initial admin account from env vars on first boot — afterwards
     // the admin account is managed entirely through the database.
     if (db.getAllAdmins().length === 0) {

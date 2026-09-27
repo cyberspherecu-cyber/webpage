@@ -28,26 +28,53 @@ const COLORS = {
   challenges: '#FF2D55',
 };
 
-const TABS = [
-  { key: 'members', label: 'Members', color: '#7C3AED' },
-  { key: 'ctf-users', label: 'CTF Accounts', color: '#00F5FF' },
-  { key: 'events', label: 'Events', color: '#FF8C00' },
-  { key: 'event-registrations', label: 'Event RSVPs', color: '#39FF14' },
-  { key: 'challenges', label: 'Challenges', color: '#FF2D55' },
-  { key: 'leaderboard', label: 'Leaderboard', color: '#FFD60A' },
-  { key: 'blog', label: 'Blog', color: '#8B5CF6' },
-  { key: 'gallery', label: 'Gallery', color: '#FFD60A' },
-  { key: 'personal-ctf', label: 'Personal CTFs', color: '#FF6B6B' },
-  { key: 'team', label: 'Team', color: '#FFD60A' },
-  { key: 'resources', label: 'Resources', color: '#39FF14' },
-  { key: 'content', label: 'Site Content', color: '#7C3AED' },
+// Sidebar navigation, grouped like a regular admin panel (Overview / CTF Arena /
+// Community / Website) instead of one cramped row of tabs. Each item carries a
+// one-line description shown in the topbar of its section.
+const NAV_SECTIONS = [
+  {
+    title: 'OVERVIEW',
+    items: [
+      { key: 'dashboard', label: 'Dashboard', color: '#00F5FF', desc: 'Club-wide stats and the weekly challenge cycle at a glance.' },
+    ],
+  },
+  {
+    title: 'CTF ARENA',
+    items: [
+      { key: 'challenges', label: 'Challenges', color: '#FF2D55', desc: 'Create and manage the weekly challenge board. It resets automatically every Monday at 00:00 — no manual archiving needed.' },
+      { key: 'personal-ctf', label: 'Personal CTFs', color: '#FF6B6B', desc: 'Private arenas with their own access codes, challenges and leaderboards.' },
+      { key: 'leaderboard', label: 'Leaderboard', color: '#FFD60A', desc: 'All-time rankings derived from real flag submissions.' },
+    ],
+  },
+  {
+    title: 'COMMUNITY',
+    items: [
+      { key: 'members', label: 'Members', color: '#7C3AED', desc: 'Club membership registrations submitted from the Join page.' },
+      { key: 'ctf-users', label: 'CTF Accounts', color: '#00F5FF', desc: 'Player accounts registered for the CTF arena.' },
+      { key: 'event-registrations', label: 'Event RSVPs', color: '#39FF14', desc: 'RSVPs submitted from public event pages.' },
+    ],
+  },
+  {
+    title: 'WEBSITE',
+    items: [
+      { key: 'events', label: 'Events', color: '#FF8C00', desc: 'Public events, cover photos and registration counts.' },
+      { key: 'blog', label: 'Blog', color: '#8B5CF6', desc: 'Announcements and writeups — Markdown supported.' },
+      { key: 'gallery', label: 'Gallery', color: '#FFD60A', desc: 'Event photo glimpses shown on the public site.' },
+      { key: 'team', label: 'Team', color: '#FFD60A', desc: 'Core team & leadership shown on the Team page.' },
+      { key: 'resources', label: 'Resources', color: '#39FF14', desc: 'Learning resources and cheatsheets.' },
+      { key: 'content', label: 'Site Content', color: '#7C3AED', desc: 'Homepage stats, features and about section.' },
+    ],
+  },
 ];
+
+const TAB_BY_KEY = Object.fromEntries(NAV_SECTIONS.flatMap(s => s.items).map(t => [t.key, t]));
 
 // Map of tab keys to their count source (stats field name) when the tab's
 // data isn't stored in the `data` state object.
 const STAT_KEY_BY_TAB = { team: 'teamMembers', resources: 'resources' };
 
 const tabCount = (t, data, stats, liveCounts) => {
+  if (t.key === 'dashboard') return null; // dashboard shows no badge
   if (data[t.key] && Array.isArray(data[t.key])) return data[t.key].length;
   if (liveCounts[t.key] !== undefined) return liveCounts[t.key];
   const statKey = STAT_KEY_BY_TAB[t.key];
@@ -76,7 +103,7 @@ export default function Admin() {
   }, [token, navigate]);
 
   const [stats, setStats] = useState(null);
-  const [tab, setTab] = useState('members');
+  const [tab, setTab] = useState('dashboard');
   const [data, setData] = useState({ members: [], 'ctf-users': [], events: [], 'event-registrations': [], gallery: [], challenges: [], leaderboard: [], blog: [], 'personal-ctf': [] });
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -98,12 +125,6 @@ export default function Admin() {
   const [uploadingFile, setUploadingFile] = useState(false);
   const [challengeUploadError, setChallengeUploadError] = useState('');
   const [challengeFileInputKey, setChallengeFileInputKey] = useState(0);
-
-  // Archive / Reset Week state
-  const [archives, setArchives] = useState([]);
-  const [showArchiveModal, setShowArchiveModal] = useState(false);
-  const [archiving, setArchiving] = useState(false);
-  const [archiveError, setArchiveError] = useState('');
 
   // Event form state
   const [eventForm, setEventForm] = useState({ title: '', date: '', startTime: '', endTime: '', location: '', type: 'upcoming', description: '', category: 'Workshop' });
@@ -371,38 +392,20 @@ export default function Admin() {
     }
   };
 
-  // ─── CHALLENGE RESET / ARCHIVE ────────────────────────────────────────
+  // ─── WEEKLY CYCLE (dashboard action) ──────────────────────────────────
 
-  const handleResetWeek = async () => {
+  const handleStartNewWeek = async () => {
     if (!window.confirm(
-      '⚠️ ARCHIVE ALL CHALLENGES & RESET WEEK\n\n' +
-      'This will move ALL current challenges to the archive and clear the board.\n' +
-      'You can view archived challenges later.\n\n' +
-      'Proceed?'
+      'Start the new week now?\n\n' +
+      'Non-permanent challenges come off the board (they are kept internally, never deleted).\n' +
+      'Users and submissions are untouched. This normally happens automatically on Monday at 00:00.'
     )) return;
-    setArchiving(true);
-    setArchiveError('');
     try {
-      const res = await axios.post(`${API}/api/admin/challenges/reset`, {}, authHeader);
-      if (res.data.success) {
-        toast.success(res.data.message);
-        fetchAll();
-      } else {
-        setArchiveError(res.data.message || 'Archive failed.');
-      }
+      const res = await axios.post(`${API}/api/admin/challenges/reset-week`, {}, authHeader);
+      toast.success(res.data.message);
+      fetchAll();
     } catch (err) {
-      setArchiveError(err.response?.data?.message || 'Failed to reset week.');
-    }
-    setArchiving(false);
-  };
-
-  const openArchiveModal = async () => {
-    setShowArchiveModal(true);
-    try {
-      const res = await axios.get(`${API}/api/admin/challenges/archive`, authHeader);
-      setArchives(res.data || []);
-    } catch {
-      setArchives([]);
+      toast.error(err.response?.data?.message || 'Failed to start the new week.');
     }
   };
 
@@ -810,6 +813,8 @@ export default function Admin() {
   // If no token, render nothing (redirect effect handles it)
   if (!token) return null;
 
+  const activeTabMeta = TAB_BY_KEY[tab] || TAB_BY_KEY.dashboard;
+
   const tabRows = (data[tab] || []).filter(row => {
     if (!search) return true;
     const q = search.toLowerCase();
@@ -842,102 +847,104 @@ export default function Admin() {
   };
 
   return (
-    <div style={{ paddingTop: 72, minHeight: '100vh', background: 'var(--black)' }}>
-      <div style={{
-        background: 'var(--navy)', borderBottom: '1px solid #1f2937',
-        padding: '2rem 2rem 1.5rem',
+    <div style={{ display: 'flex', minHeight: '100vh', background: 'var(--black)', paddingTop: 72 }}>
+      {/* ─── SIDEBAR ─────────────────────────────────────────────────────── */}
+      <aside style={{
+        width: 240, minWidth: 240, position: 'sticky', top: 72,
+        height: 'calc(100vh - 72px)', overflowY: 'auto',
+        background: 'var(--navy)', borderRight: '1px solid #1f2937',
+        padding: '1.5rem 0.9rem', boxSizing: 'border-box',
       }}>
-        <div style={{ maxWidth: 1200, margin: '0 auto', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 16 }}>
-          <div>
-            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: '#00F5FF', letterSpacing: 4, marginBottom: 8 }}>// ADMIN_DASHBOARD</div>
-            <h1 style={{ fontFamily: 'var(--font-display)', fontSize: 'clamp(1.6rem, 4vw, 2.4rem)', fontWeight: 900 }}>Club Overview</h1>
-          </div>
-          <button onClick={handleLogout} style={{
-            padding: '10px 20px', background: 'transparent', color: '#6B7280',
-            border: '1px solid #1f2937', borderRadius: 8, fontFamily: 'var(--font-mono)',
-            fontSize: 12, letterSpacing: 1, cursor: 'pointer', transition: 'all 0.2s',
-          }}
-            onMouseEnter={e => { e.currentTarget.style.color = '#FF2D55'; e.currentTarget.style.borderColor = '#FF2D5550'; }}
-            onMouseLeave={e => { e.currentTarget.style.color = '#6B7280'; e.currentTarget.style.borderColor = '#1f2937'; }}
-          >LOGOUT</button>
+        <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: '#00F5FF', letterSpacing: 3, marginBottom: 18, paddingLeft: 10 }}>
+          // ADMIN_PANEL
         </div>
-      </div>
-
-      <div style={{ maxWidth: 1200, margin: '0 auto', padding: '2.5rem 2rem' }}>
-        {/* STATS */}
-        {stats && (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 16, marginBottom: 36 }}>
-            {[
-              { label: 'Members', value: stats.members, color: '#7C3AED' },
-              { label: 'CTF Accounts', value: stats.ctfUsers, color: '#00F5FF' },
-              { label: 'Event RSVPs', value: stats.eventRegistrations, color: '#39FF14' },
-              { label: 'Flags Captured', value: stats.correctSubmissions, color: '#FFD60A' },
-              { label: 'Gallery Photos', value: stats.galleryPhotos, color: '#FF2D55' },
-              { label: 'Weekly Active', value: stats.weeklyActivePlayers || 0, color: '#39FF14' },
-              { label: 'Challenges', value: (data.challenges || []).length, color: '#8B5CF6' },
-              { label: 'Events', value: stats.events || 0, color: '#FF8C00' },
-              { label: 'Team', value: stats.teamMembers || 0, color: '#FFD60A' },
-              { label: 'Resources', value: stats.resources || 0, color: '#39FF14' },
-              { label: 'Blog Posts', value: stats.blogPosts || 0, color: '#8B5CF6' },
-            ].map(s => (
-              <div key={s.label} style={{ background: 'var(--card)', border: `1px solid ${s.color}30`, borderRadius: 12, padding: '1.2rem' }}>
-                <div style={{ fontFamily: 'var(--font-display)', fontSize: 30, fontWeight: 900, color: s.color }}>{s.value}</div>
-                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: '#6B7280', letterSpacing: 1, marginTop: 4 }}>{s.label.toUpperCase()}</div>
-              </div>
-            ))}
+        {NAV_SECTIONS.map(section => (
+          <div key={section.title} style={{ marginBottom: 20 }}>
+            <div style={{
+              fontFamily: 'var(--font-mono)', fontSize: 9, color: '#4B5563',
+              letterSpacing: 2, marginBottom: 6, paddingLeft: 10, fontWeight: 700,
+            }}>{section.title}</div>
+            {section.items.map(t => {
+              const active = tab === t.key;
+              const count = tabCount(t, data, stats, liveCounts);
+              return (
+                <button key={t.key} onClick={() => { setTab(t.key); setSearch(''); }} style={{
+                  display: 'flex', alignItems: 'center', gap: 8, width: '100%',
+                  padding: '8px 10px', marginBottom: 2, textAlign: 'left',
+                  background: active ? `${t.color}15` : 'transparent',
+                  color: active ? t.color : '#9CA3AF',
+                  border: 'none', borderLeft: `2px solid ${active ? t.color : 'transparent'}`,
+                  borderRadius: 6, fontFamily: 'var(--font-mono)', fontSize: 12,
+                  cursor: 'pointer', transition: 'all 0.15s',
+                }}
+                  onMouseEnter={e => { if (!active) e.currentTarget.style.background = '#ffffff08'; }}
+                  onMouseLeave={e => { if (!active) e.currentTarget.style.background = 'transparent'; }}
+                >
+                  <span style={{ flex: 1 }}>{t.label}</span>
+                  {count !== null && count > 0 && (
+                    <span style={{
+                      fontFamily: 'var(--font-mono)', fontSize: 10,
+                      background: active ? `${t.color}25` : '#1f2937',
+                      color: active ? t.color : '#6B7280',
+                      padding: '1px 7px', borderRadius: 10,
+                    }}>{count}</span>
+                  )}
+                </button>
+              );
+            })}
           </div>
-        )}
+        ))}
+        <div style={{ borderTop: '1px solid #1f2937', paddingTop: 14, marginTop: 4 }}>
+          <button onClick={handleLogout} style={{
+            display: 'flex', alignItems: 'center', gap: 8, width: '100%',
+            padding: '8px 10px', background: 'transparent', color: '#6B7280',
+            border: 'none', borderRadius: 6, fontFamily: 'var(--font-mono)', fontSize: 12,
+            cursor: 'pointer', transition: 'all 0.15s',
+          }}
+            onMouseEnter={e => { e.currentTarget.style.color = '#FF2D55'; e.currentTarget.style.background = '#FF2D550d'; }}
+            onMouseLeave={e => { e.currentTarget.style.color = '#6B7280'; e.currentTarget.style.background = 'transparent'; }}
+          >↪ LOGOUT</button>
+        </div>
+      </aside>
 
-        {/* TABS + SEARCH */}
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12, marginBottom: 20 }}>
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            {TABS.map(t => (
-              <button key={t.key} onClick={() => { setTab(t.key); setSearch(''); setShowChallengeForm(false); }} style={{
-                padding: '8px 16px', background: tab === t.key ? `${t.color}20` : 'transparent',
-                color: tab === t.key ? t.color : '#6B7280', border: `1px solid ${tab === t.key ? t.color + '50' : '#1f2937'}`,
-                borderRadius: 8, fontFamily: 'var(--font-mono)', fontSize: 12, letterSpacing: 1, cursor: 'pointer', transition: 'all 0.2s',
-              }}>{t.label} ({tabCount(t, data, stats, liveCounts)})</button>
-            ))}
-          </div>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            {tab === 'blog' && (
-              <button onClick={openNewBlogForm} style={{
-                padding: '8px 16px', background: '#8B5CF620', color: '#8B5CF6',
-                border: '1px solid #8B5CF650', borderRadius: 8, fontFamily: 'var(--font-mono)',
-                fontSize: 12, letterSpacing: 1, cursor: 'pointer', transition: 'all 0.2s',
-              }}
-                onMouseEnter={e => e.currentTarget.style.background = '#8B5CF630'}
-                onMouseLeave={e => e.currentTarget.style.background = '#8B5CF620'}
-              >+ NEW POST</button>
-            )}
-            {tab === 'events' && (
-              <button onClick={openNewEventForm} style={{
-                padding: '8px 16px', background: '#FF8C0020', color: '#FF8C00',
-                border: '1px solid #FF8C0050', borderRadius: 8, fontFamily: 'var(--font-mono)',
-                fontSize: 12, letterSpacing: 1, cursor: 'pointer', transition: 'all 0.2s',
-              }}
-                onMouseEnter={e => e.currentTarget.style.background = '#FF8C0030'}
-                onMouseLeave={e => e.currentTarget.style.background = '#FF8C0020'}
-              >+ NEW EVENT</button>
-            )}
-            {tab === 'challenges' && (
-              <>
-                <button onClick={openArchiveModal} style={{
-                  padding: '8px 16px', background: 'transparent', color: '#8B5CF6',
-                  border: '1px solid #8B5CF640', borderRadius: 8, fontFamily: 'var(--font-mono)',
+      {/* ─── MAIN ────────────────────────────────────────────────────────── */}
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+        {/* TOPBAR — section title, description and contextual actions */}
+        <div style={{
+          background: 'var(--navy)', borderBottom: '1px solid #1f2937',
+          padding: '1.4rem 2.5rem',
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+            <div style={{ maxWidth: 640 }}>
+              <h1 style={{ fontFamily: 'var(--font-display)', fontSize: 22, fontWeight: 900, color: activeTabMeta.color, letterSpacing: 1 }}>
+                {activeTabMeta.label}
+              </h1>
+              <p style={{ color: '#6B7280', fontFamily: 'var(--font-mono)', fontSize: 12, marginTop: 4, lineHeight: 1.6 }}>
+                {activeTabMeta.desc}
+              </p>
+            </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              {tab === 'blog' && (
+                <button onClick={openNewBlogForm} style={{
+                  padding: '8px 16px', background: '#8B5CF620', color: '#8B5CF6',
+                  border: '1px solid #8B5CF650', borderRadius: 8, fontFamily: 'var(--font-mono)',
                   fontSize: 12, letterSpacing: 1, cursor: 'pointer', transition: 'all 0.2s',
                 }}
-                  onMouseEnter={e => e.currentTarget.style.background = '#8B5CF615'}
-                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                >📦 ARCHIVE</button>
-                <button onClick={handleResetWeek} disabled={archiving} style={{
-                  padding: '8px 16px', background: '#7C3AED20', color: '#7C3AED',
-                  border: '1px solid #7C3AED50', borderRadius: 8, fontFamily: 'var(--font-mono)',
-                  fontSize: 12, letterSpacing: 1, cursor: 'pointer', opacity: archiving ? 0.6 : 1, transition: 'all 0.2s',
+                  onMouseEnter={e => e.currentTarget.style.background = '#8B5CF630'}
+                  onMouseLeave={e => e.currentTarget.style.background = '#8B5CF620'}
+                >+ NEW POST</button>
+              )}
+              {tab === 'events' && (
+                <button onClick={openNewEventForm} style={{
+                  padding: '8px 16px', background: '#FF8C0020', color: '#FF8C00',
+                  border: '1px solid #FF8C0050', borderRadius: 8, fontFamily: 'var(--font-mono)',
+                  fontSize: 12, letterSpacing: 1, cursor: 'pointer', transition: 'all 0.2s',
                 }}
-                  onMouseEnter={e => { if (!archiving) e.currentTarget.style.background = '#7C3AED30'; }}
-                  onMouseLeave={e => { if (!archiving) e.currentTarget.style.background = '#7C3AED20'; }}
-                >{archiving ? 'ARCHIVING…' : '🔄 RESET WEEK'}</button>
+                  onMouseEnter={e => e.currentTarget.style.background = '#FF8C0030'}
+                  onMouseLeave={e => e.currentTarget.style.background = '#FF8C0020'}
+                >+ NEW EVENT</button>
+              )}
+              {tab === 'challenges' && (
                 <button onClick={openNewChallengeForm} style={{
                   padding: '8px 16px', background: '#FF2D5520', color: '#FF2D55',
                   border: '1px solid #FF2D5550', borderRadius: 8, fontFamily: 'var(--font-mono)',
@@ -946,28 +953,94 @@ export default function Admin() {
                   onMouseEnter={e => e.currentTarget.style.background = '#FF2D5530'}
                   onMouseLeave={e => e.currentTarget.style.background = '#FF2D5520'}
                 >+ NEW CHALLENGE</button>
-              </>
-            )}
-            {tab === 'personal-ctf' && (
-              <button onClick={() => openNewPctfForm()} style={{
-                padding: '8px 16px', background: '#FF6B6B20', color: '#FF6B6B',
-                border: '1px solid #FF6B6B50', borderRadius: 8, fontFamily: 'var(--font-mono)',
-                fontSize: 12, letterSpacing: 1, cursor: 'pointer', transition: 'all 0.2s',
-              }}
-                onMouseEnter={e => e.currentTarget.style.background = '#FF6B6B30'}
-                onMouseLeave={e => e.currentTarget.style.background = '#FF6B6B20'}
-              >+ NEW CTF</button>
-            )}
-            {tab !== 'challenges' && tab !== 'events' && tab !== 'personal-ctf' && tab !== 'team' && tab !== 'resources' && tab !== 'content' && (
-              <input
-                placeholder={tab === 'blog' ? 'Search posts…' : 'Search…'}
-                value={search}
-                onChange={e => setSearch(e.target.value)}
-                style={{ ...inputStyle, width: 220 }}
-              />
-            )}
+              )}
+              {tab === 'personal-ctf' && (
+                <button onClick={() => openNewPctfForm()} style={{
+                  padding: '8px 16px', background: '#FF6B6B20', color: '#FF6B6B',
+                  border: '1px solid #FF6B6B50', borderRadius: 8, fontFamily: 'var(--font-mono)',
+                  fontSize: 12, letterSpacing: 1, cursor: 'pointer', transition: 'all 0.2s',
+                }}
+                  onMouseEnter={e => e.currentTarget.style.background = '#FF6B6B30'}
+                  onMouseLeave={e => e.currentTarget.style.background = '#FF6B6B20'}
+                >+ NEW CTF</button>
+              )}
+              {tab !== 'challenges' && tab !== 'events' && tab !== 'personal-ctf' && tab !== 'team' && tab !== 'resources' && tab !== 'content' && tab !== 'dashboard' && (
+                <input
+                  placeholder={tab === 'blog' ? 'Search posts…' : 'Search…'}
+                  value={search}
+                  onChange={e => setSearch(e.target.value)}
+                  style={{ ...inputStyle, width: 220 }}
+                />
+              )}
+            </div>
           </div>
         </div>
+
+        {/* CONTENT AREA */}
+        <div style={{ padding: '2rem 2.5rem 3rem', flex: 1 }}>
+        {/* ─── DASHBOARD TAB ─────────────────────────────────────────────── */}
+        {tab === 'dashboard' && (
+          <>
+            {/* Weekly cycle banner */}
+            <div style={{
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              gap: 16, flexWrap: 'wrap', background: 'var(--card)',
+              border: '1px solid #00F5FF30', borderRadius: 12, padding: '1.4rem 1.6rem', marginBottom: 28,
+            }}>
+              <div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: '#00F5FF', letterSpacing: 2, marginBottom: 6 }}>
+                  // WEEKLY CYCLE — AUTO-RESETS EVERY MONDAY 00:00
+                </div>
+                <div style={{ fontFamily: 'var(--font-display)', fontSize: 19, fontWeight: 800, color: '#E2E8F0' }}>
+                  {stats?.week?.weekLabel || 'Current week'}
+                </div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11.5, color: '#6B7280', marginTop: 6 }}>
+                  Resets automatically right after Sunday ends — no archiving, no data loss.
+                  {stats?.week?.lastResetAt && ` Last rollover: ${new Date(stats.week.lastResetAt).toLocaleString()}`}
+                </div>
+              </div>
+              <button onClick={handleStartNewWeek} style={{
+                padding: '10px 18px', background: '#00F5FF15', color: '#00F5FF',
+                border: '1px solid #00F5FF50', borderRadius: 8, fontFamily: 'var(--font-mono)',
+                fontSize: 12, letterSpacing: 1, cursor: 'pointer', transition: 'all 0.2s', whiteSpace: 'nowrap',
+              }}
+                onMouseEnter={e => e.currentTarget.style.background = '#00F5FF25'}
+                onMouseLeave={e => e.currentTarget.style.background = '#00F5FF15'}
+              >START NEW WEEK NOW</button>
+            </div>
+
+            {/* Stat cards */}
+            {stats && (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16 }}>
+                {[
+                  { label: 'Members', value: stats.members, color: '#7C3AED', tab: 'members' },
+                  { label: 'CTF Accounts', value: stats.ctfUsers, color: '#00F5FF', tab: 'ctf-users' },
+                  { label: 'Event RSVPs', value: stats.eventRegistrations, color: '#39FF14', tab: 'event-registrations' },
+                  { label: 'Flags Captured', value: stats.correctSubmissions, color: '#FFD60A', tab: 'leaderboard' },
+                  { label: 'Weekly Active', value: stats.weeklyActivePlayers || 0, color: '#39FF14', tab: 'leaderboard' },
+                  { label: 'Challenges', value: (data.challenges || []).length, color: '#FF2D55', tab: 'challenges' },
+                  { label: 'Events', value: stats.events || 0, color: '#FF8C00', tab: 'events' },
+                  { label: 'Blog Posts', value: stats.blogPosts || 0, color: '#8B5CF6', tab: 'blog' },
+                  { label: 'Gallery Photos', value: stats.galleryPhotos || 0, color: '#FFD60A', tab: 'gallery' },
+                  { label: 'Team', value: stats.teamMembers || 0, color: '#FFD60A', tab: 'team' },
+                  { label: 'Resources', value: stats.resources || 0, color: '#39FF14', tab: 'resources' },
+                  { label: 'Personal CTFs', value: stats.personalCtfs || 0, color: '#FF6B6B', tab: 'personal-ctf' },
+                ].map(s => (
+                  <button key={s.label} onClick={() => s.tab && setTab(s.tab)} style={{
+                    textAlign: 'left', background: 'var(--card)', border: `1px solid ${s.color}30`,
+                    borderRadius: 12, padding: '1.2rem', cursor: s.tab ? 'pointer' : 'default', transition: 'all 0.2s',
+                  }}
+                    onMouseEnter={e => { if (s.tab) e.currentTarget.style.borderColor = `${s.color}60`; }}
+                    onMouseLeave={e => { if (s.tab) e.currentTarget.style.borderColor = `${s.color}30`; }}
+                  >
+                    <div style={{ fontFamily: 'var(--font-display)', fontSize: 30, fontWeight: 900, color: s.color }}>{s.value}</div>
+                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: '#6B7280', letterSpacing: 1, marginTop: 4 }}>{s.label.toUpperCase()}</div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </>
+        )}
 
         {/* ─── CHALLENGES TAB ────────────────────────────────────────────── */}
         {tab === 'challenges' && (
@@ -1174,89 +1247,6 @@ export default function Admin() {
                 </table>
               )}
             </div>
-
-            {/* Archive viewer modal */}
-            {showArchiveModal && (
-              <div style={{
-                position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', zIndex: 9999,
-                display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem',
-                backdropFilter: 'blur(8px)',
-              }} onClick={e => { if (e.target === e.currentTarget) setShowArchiveModal(false); }}>
-                <div style={{
-                  background: 'var(--card)', border: '1px solid #1f2937', borderRadius: 16,
-                  padding: '2rem', maxWidth: 900, width: '100%', maxHeight: '90vh', overflowY: 'auto',
-                }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
-                    <div>
-                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: '#8B5CF6', letterSpacing: 2, marginBottom: 4 }}>// ARCHIVE</div>
-                      <h3 style={{ fontFamily: 'var(--font-display)', fontSize: 18, fontWeight: 700 }}>Archived Challenge Sets</h3>
-                    </div>
-                    <button onClick={() => setShowArchiveModal(false)} style={{
-                      background: 'transparent', border: '1px solid #1f2937', color: '#6B7280',
-                      borderRadius: 6, padding: '6px 12px', fontFamily: 'var(--font-mono)', fontSize: 12, cursor: 'pointer',
-                    }}>✕</button>
-                  </div>
-
-                  {archiveError && (
-                    <div style={{
-                      padding: '10px 14px', borderRadius: 8, background: '#FF2D5515',
-                      border: '1px solid #FF2D5540', color: '#FF2D55',
-                      fontFamily: 'var(--font-mono)', fontSize: 12, marginBottom: 16,
-                    }}>✗ {archiveError}</div>
-                  )}
-
-                  {archives.length === 0 ? (
-                    <div style={{ padding: '3rem', textAlign: 'center', color: '#6B7280', fontFamily: 'var(--font-mono)', fontSize: 13 }}>
-                      No archived weeks yet. Use <span style={{ color: '#8B5CF6' }}>RESET WEEK</span> to archive the current challenge set and start fresh.
-                    </div>
-                  ) : (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-                      {archives.map((archive, idx) => (
-                        <div key={idx} style={{
-                          background: '#0A0A0F', border: '1px solid #1f2937', borderRadius: 10,
-                          padding: '1.2rem',
-                        }}>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: '#8B5CF6', fontWeight: 700 }}>
-                                Week {archives.length - idx}
-                              </span>
-                              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: '#6B7280' }}>
-                                {archive.weekLabel}
-                              </span>
-                            </div>
-                            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: '#9CA3AF' }}>
-                              {archive.challenges.length} challenge{archive.challenges.length !== 1 ? 's' : ''}
-                            </span>
-                          </div>
-                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 8 }}>
-                            {archive.challenges.map(ch => (
-                              <div key={ch.id} style={{
-                                background: 'var(--card)', borderRadius: 8, padding: '10px 12px',
-                                border: '1px solid #1f293780',
-                              }}>
-                                <div style={{ fontFamily: 'var(--font-display)', fontSize: 13, fontWeight: 600, color: '#E2E8F0', marginBottom: 4 }}>{ch.title}</div>
-                                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: '#FFD60A' }}>{ch.points}pts</span>
-                                  <span style={{
-                                    fontFamily: 'var(--font-mono)', fontSize: 10, color: '#6B7280',
-                                    background: '#1f2937', padding: '1px 6px', borderRadius: 4,
-                                  }}>{ch.category}</span>
-                                  <span style={{
-                                    fontFamily: 'var(--font-mono)', fontSize: 10,
-                                    color: ({ Easy: '#39FF14', Medium: '#FFD60A', Hard: '#FF2D55', Insane: '#FF8C00' })[ch.difficulty] || '#6B7280',
-                                  }}>{ch.difficulty}</span>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
           </>
         )}
 
@@ -2062,7 +2052,7 @@ export default function Admin() {
         )}
 
         {/* ─── OTHER TABS (members, ctf-users, event-registrations) ─────────── */}
-        {tab !== 'challenges' && tab !== 'gallery' && tab !== 'leaderboard' && tab !== 'events' && tab !== 'blog' && tab !== 'personal-ctf' && (
+        {tab === 'members' || tab === 'ctf-users' || tab === 'event-registrations' ? (
           <>
             {/* Bulk delete action bar */}
             {selectedIds.length > 0 && (
@@ -2176,7 +2166,7 @@ export default function Admin() {
               )}
             </div>
           </>
-        )}
+        ) : null}
 
         {/* ─── MEMBER EDIT MODAL ─────────────────────────────────────────── */}
         {showMemberForm && (
@@ -2313,6 +2303,7 @@ export default function Admin() {
             </div>
           </div>
         )}
+        </div>
       </div>
     </div>
   );

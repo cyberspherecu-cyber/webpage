@@ -957,40 +957,115 @@ function getGhostCompletionCount() {
 
 // ─── WEEKLY ACTIVE PLAYERS (admin stats) ─────────────────────────────────
 
-// ─── CHALLENGE RESET / ARCHIVE ─────────────────────────────────────────
+// ─── WEEKLY CHALLENGE CYCLE (automatic) ─────────────────────────────────
+// The archive feature has been removed. The week rolls over automatically at
+// Monday 00:00 (right after Sunday ends): non-permanent challenges come off
+// the active board and are preserved in `db.pastChallenges` (an internal
+// safety store with no UI) so no data is ever destroyed. Users, submissions,
+// and all other data are untouched. The last rollover is recorded in
+// `db.weekInfo`, making the rollover restart-safe: if the server is down
+// across a Monday boundary, the rollover runs once on the next boot/request.
 
-function archiveChallenges() {
-  // Permanent challenges (e.g. Ghost Protocol) always stay on the board
-  const permanent = (db.challenges || []).filter(c => c.permanent);
-  const regular = (db.challenges || []).filter(c => !c.permanent);
-  if (regular.length === 0) return { archived: false, message: 'No challenges to archive.' };
-
-  const now = new Date();
-  const weekStart = getStartOfWeek(now);
+function labelForWeek(weekStart) {
   const weekEnd = new Date(weekStart);
-  weekEnd.setDate(weekEnd.getDate() + 7);
-
-  const weekLabel = `${weekStart.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })} - ${weekEnd.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}`;
-
-  const archiveEntry = {
-    archivedAt: now.toISOString(),
-    weekLabel,
-    challenges: regular,
-  };
-
-  if (!db.archivedChallenges) db.archivedChallenges = [];
-  db.archivedChallenges.unshift(archiveEntry);
-
-  // Keep permanent challenges, reset the counter above the highest remaining id
-  db.challenges = permanent;
-  db.nextChallengeId = (permanent.length ? Math.max(...permanent.map(c => c.id)) : 0) + 1;
-
-  save(db);
-  return { archived: true, weekLabel, count: regular.length };
+  weekEnd.setDate(weekEnd.getDate() + 6); // week runs Mon–Sun
+  return `${weekStart.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })} - ${weekEnd.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}`;
 }
 
-function getArchivedChallenges() {
-  return db.archivedChallenges || [];
+// Rolls the board over to a new week. Nothing is deleted: challenges that
+// leave the board are kept in db.pastChallenges (deduplicated by id) and the
+// id counter never reuses numbers, so historical submissions stay accurate.
+function runWeeklyReset() {
+  const now = new Date();
+  const weekStart = getStartOfWeek(now);
+
+  const permanent = (db.challenges || []).filter(c => c.permanent);
+  const regular = (db.challenges || []).filter(c => !c.permanent);
+
+  if (regular.length > 0) {
+    if (!db.pastChallenges) db.pastChallenges = [];
+    const kept = new Set(db.pastChallenges.map(c => c.id));
+    for (const ch of regular) {
+      if (!kept.has(ch.id)) {
+        db.pastChallenges.push({ ...ch, removedFromBoardAt: now.toISOString() });
+        kept.add(ch.id);
+      }
+    }
+  }
+
+  db.challenges = permanent;
+  // Keep the id counter monotonic — never reuse challenge ids, otherwise old
+  // submissions would be scored against whatever new challenge occupies the id.
+  db.nextChallengeId = Math.max(db.nextChallengeId || 1, ...db.challenges.map(c => c.id), 0) + 1;
+
+  db.weekInfo = { weekStart: weekStart.toISOString(), resetAt: now.toISOString() };
+  save(db);
+  return {
+    reset: true,
+    weekStart: weekStart.toISOString(),
+    weekLabel: labelForWeek(weekStart),
+    cleared: regular.length,
+  };
+}
+
+// Migrates data from the old archive feature: any challenges that were sitting
+// in `archivedChallenges` are merged back into the regular challenge board and
+// the archive is deleted. One-time migration — safe to run on every boot.
+function restoreArchivedChallenges() {
+  const archives = db.archivedChallenges;
+  if (!Array.isArray(archives) || archives.length === 0) return { restored: 0 };
+
+  if (!db.challenges) db.challenges = [];
+  const existingIds = new Set(db.challenges.map(c => c.id));
+  let restored = 0;
+
+  // Flatten every archived set and re-add its challenges (deduplicated by id,
+  // with new ids for collisions) so no challenge data is lost.
+  for (const entry of archives) {
+    for (const ch of entry.challenges || []) {
+      if (existingIds.has(ch.id)) {
+        const copy = { ...ch, id: db.nextChallengeId++ };
+        db.challenges.push(copy);
+      } else {
+        existingIds.add(ch.id);
+        db.challenges.push({ ...ch });
+      }
+      restored++;
+    }
+  }
+
+  db.nextChallengeId = Math.max(db.nextChallengeId, ...db.challenges.map(c => c.id)) + 1;
+  delete db.archivedChallenges;
+  save(db);
+  return { restored };
+}
+
+// Runs the weekly rollover automatically whenever the current week has changed
+// since the last recorded rollover (idempotent — cheap to call on every request).
+// On the very first run (no weekInfo recorded yet) it only records the current
+// week — it does NOT clear the board, so upgrading deployments keep their data.
+function maybeRunWeeklyReset() {
+  const weekStart = getStartOfWeek().toISOString();
+  if (db.weekInfo && db.weekInfo.weekStart === weekStart) return null;
+  if (!db.weekInfo) {
+    // First run after upgrade: adopt the current week without touching the board.
+    db.weekInfo = { weekStart, resetAt: new Date().toISOString() };
+    save(db);
+    return null;
+  }
+  return runWeeklyReset();
+}
+
+function getCurrentWeekInfo() {
+  const weekStart = getStartOfWeek();
+  const weekEnd = new Date(weekStart);
+  weekEnd.setDate(weekEnd.getDate() + 7); // next Monday 00:00
+  return {
+    weekLabel: labelForWeek(weekStart),
+    weekStart: weekStart.toISOString(),
+    weekEnd: weekEnd.toISOString(),
+    lastResetAt: db.weekInfo ? db.weekInfo.resetAt : null,
+  };
 }
 
 function getWeeklyActivePlayers() {
@@ -1329,8 +1404,10 @@ module.exports = {
   getGhostCompletionCount,
   getWeeklyLeaderboard,
   getWeeklyActivePlayers,
-  archiveChallenges,
-  getArchivedChallenges,
+  restoreArchivedChallenges,
+  maybeRunWeeklyReset,
+  runWeeklyReset,
+  getCurrentWeekInfo,
   ensureGhostChallenge,
   getAllEvents,
   getEventById,
