@@ -6,7 +6,7 @@ export default function GhostProtocol() {
 
   const lines = [
     { text: '[BOOT] Initializing Ghost Protocol v3.1.7...', delay: 500 },
-    { text: '[BOOT] Establishing encrypted通道...', delay: 800 },
+    { text: '[BOOT] Establishing encrypted channel...', delay: 800 },
     { text: '[BOOT] Connection lost. Retrying...', delay: 600 },
     { text: '[SEC]  WARNING: Unauthorized access detected.', delay: 700 },
     { text: '[SEC]  Tracing origin IP... 103.95.xxx.xxx', delay: 900 },
@@ -18,16 +18,16 @@ export default function GhostProtocol() {
   ];
 
   useEffect(() => {
-    let idx = 0;
-    const timer = setInterval(() => {
-      if (idx < lines.length) {
-        setOutput(prev => [...prev, { id: Date.now() + idx, ...lines[idx] }]);
-        idx++;
-      } else {
-        clearInterval(timer);
-      }
-    }, 700);
-    return () => clearInterval(timer);
+    // Type out each line honoring its per-line delay (cumulative offsets).
+    const timers = [];
+    let acc = 0;
+    lines.forEach((line, i) => {
+      acc += line.delay;
+      timers.push(setTimeout(() => {
+        setOutput(prev => [...prev, { id: i, ...line }]);
+      }, acc));
+    });
+    return () => timers.forEach(clearTimeout);
   }, []);
 
   return (
@@ -74,7 +74,6 @@ export default function GhostProtocol() {
               lineHeight: 1.8,
               fontFamily: "'Courier New', monospace",
               opacity: 0.9,
-              animation: line.blink ? 'none' : 'none',
             }}>
               {line.text}
               {line.blink && <span style={{ animation: 'blink 1s infinite', color: '#39FF14' }}>█</span>}

@@ -1241,11 +1241,16 @@ app.get('/api/ghost-completions', (req, res) => {
     await db.init();
     await ensureBucket();
     db.ensureEventCoverPhotos();
-    db.ensureGhostChallenge();
     // One-time migration from the removed archive feature: put any archived
     // challenges back on the regular board, then delete the archive store.
     const restored = db.restoreArchivedChallenges();
     if (restored.restored > 0) console.log(`♻️  Restored ${restored.restored} archived challenge(s) to the regular board.`);
+    // Collapse any duplicate challenges (keeps earliest copy, re-points
+    // submissions/stats so scores survive), then make sure exactly one Ghost
+    // Protocol challenge exists with the intended point value.
+    const deduped = db.dedupeChallenges();
+    if (deduped.removed > 0) console.log(`🧹 Removed ${deduped.removed} duplicate challenge(s); submissions re-pointed to the kept copies.`);
+    db.ensureGhostChallenge();
     // Run the automatic weekly rollover if the calendar week changed while down.
     const reset = db.maybeRunWeeklyReset();
     if (reset) console.log(`🔄 Weekly challenge rollover applied for week of ${reset.weekLabel} (cleared ${reset.cleared}).`);

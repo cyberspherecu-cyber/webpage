@@ -631,7 +631,7 @@ function updatePasswordHash(id, passwordHash) {
 const GHOST_CHALLENGE = {
   title: 'Ghost Protocol',
   category: 'Misc',
-  points: 500,
+  points: 100,
   difficulty: 'Insane',
   description: 'A rogue terminal is broadcasting secrets on the network, claiming to host the Ghost Protocol — an unauthorized authentication system. Your mission: locate the hidden terminal, extract its authentication token, and submit it as the flag to breach the protocol. Those who succeed are immortalized in the Wall of Fame.\n\nEvery hacker leaves a digital trail — check the console and the page source.',
   hint: 'Visit /ghost-protocol and read its page source carefully. The token is hiding in the comments, base64-encoded.',
@@ -641,15 +641,86 @@ const GHOST_CHALLENGE = {
   solvedCount: 0,
 };
 
-// Ensures the permanent Ghost Protocol challenge exists. Re-adds it on fresh
-// databases or if it was somehow removed (handles existing data.db.json files).
+// Ensures the permanent Ghost Protocol challenge exists — exactly one copy.
+// Re-adds it on fresh databases or if it was somehow removed, and keeps an
+// already-stored record in sync with the intended point value.
 function ensureGhostChallenge() {
   if (!db.challenges) db.challenges = [];
-  if (db.challenges.some(c => c.ghost || c.title === 'Ghost Protocol')) return;
+  const existing = db.challenges.find(c => c.ghost || c.title === 'Ghost Protocol');
+  if (existing) {
+    if (existing.points !== GHOST_CHALLENGE.points) {
+      existing.points = GHOST_CHALLENGE.points;
+      save(db);
+    }
+    return existing;
+  }
   const ghost = { ...GHOST_CHALLENGE, id: db.nextChallengeId++ };
   db.challenges.push(ghost);
   save(db);
   return ghost;
+}
+
+// ─── CHALLENGE DEDUPLICATION ──────────────────────────────────────────────
+// Guards against the same challenge appearing twice on the board (e.g. after
+// data migrations or repeated creation). Keeps the earliest copy of each
+// challenge — identified by the ghost flag or a normalized title+category —
+// and re-points submissions/solve stats from removed duplicates onto the kept
+// one so no leaderboard scores are lost. Only writes when something changed.
+function challengeDedupeKey(c) {
+  if (c.ghost) return 'ghost';
+  return `title:${(c.title || '').trim().toLowerCase()}|${(c.category || '').trim().toLowerCase()}`;
+}
+
+function dedupeChallenges() {
+  if (!Array.isArray(db.challenges)) return { removed: 0 };
+  const keptByKey = new Map();
+  const idMap = new Map(); // duplicate id -> kept id
+  const kept = [];
+
+  for (const c of db.challenges) {
+    const key = challengeDedupeKey(c);
+    const first = keptByKey.get(key);
+    if (!first) {
+      keptByKey.set(key, c);
+      kept.push(c);
+    } else {
+      idMap.set(c.id, first.id);
+      // Preserve the highest stored solve count seen among duplicates.
+      if ((c.solvedCount || 0) > (first.solvedCount || 0)) first.solvedCount = c.solvedCount;
+    }
+  }
+
+  if (idMap.size === 0) return { removed: 0 };
+
+  // Re-point submissions and per-challenge solve stats onto the kept
+  // challenge so points earned through duplicates survive the cleanup.
+  db.submissions = (db.submissions || []).map(s =>
+    idMap.has(s.challengeId) ? { ...s, challengeId: idMap.get(s.challengeId) } : s
+  );
+  const mergedStats = {};
+  for (const [key, value] of Object.entries(db.challengeStats || {})) {
+    const id = Number(key);
+    const target = idMap.has(id) ? idMap.get(id) : id;
+    mergedStats[target] = (mergedStats[target] || 0) + (value || 0);
+  }
+  db.challengeStats = mergedStats;
+
+  // A player may now hold two correct submissions for the same challenge
+  // (solved once via each duplicate). Keep only the earliest correct one per
+  // (username, challengeId) so points aren't double-counted. Submissions are
+  // stored in insertion (chronological) order.
+  const seenCorrect = new Set();
+  db.submissions = db.submissions.filter(s => {
+    if (!s.correct) return true;
+    const k = `${s.username}|${s.challengeId}`;
+    if (seenCorrect.has(k)) return false;
+    seenCorrect.add(k);
+    return true;
+  });
+
+  db.challenges = kept;
+  save(db);
+  return { removed: idMap.size };
 }
 
 // ─── CHALLENGES (admin CRUD) ──────────────────────────────────────────────
@@ -663,6 +734,12 @@ function getChallengeById(id) {
 }
 
 function createChallenge({ title, category, points, difficulty, description, hint, flag }) {
+  // Prevent duplicates: reuse the existing challenge when the title matches.
+  const existing = db.challenges.find(
+    c => (c.title || '').trim().toLowerCase() === String(title || '').trim().toLowerCase()
+  );
+  if (existing) return existing;
+
   const challenge = {
     id: db.nextChallengeId++,
     title,
@@ -1409,6 +1486,7 @@ module.exports = {
   runWeeklyReset,
   getCurrentWeekInfo,
   ensureGhostChallenge,
+  dedupeChallenges,
   getAllEvents,
   getEventById,
   createEvent,
